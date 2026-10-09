@@ -1,0 +1,18 @@
+argostranslate>=1.9
+
+# TTS (Coqui) ne supporte que Python 3.9-3.11.
+# Sur Python 3.12+, remplace la ligne TTS ci-dessous par : coqui-tts>=0.25
+# (fork communautaire maintenu, meme API `from TTS.api import TTS`)
+TTS>=0.22
+
+# Pin obligatoire : les versions recentes de transformers ont supprime
+# `BeamSearchScorer` du module public, ce qui casse le chargement de XTTS-v2
+# ("ImportError: cannot import name 'BeamSearchScorer' from 'transformers'").
+transformers==4.36.2
+
+# Pour utiliser le GPU (case "Utiliser le GPU (CUDA)" dans l'app), installe
+# EN PLUS un torch avec support CUDA correspondant a ton GPU/driver, par
+# exemple (CUDA 12.1) :
+#   pip install torch --index-url https://download.pytorch.org/whl/cu121
+# Voir https://pytorch.org/get-started/locally/ pour la commande exacte.
+# Sans cela, torch.cuda.is_available() renvoie False et tout tourne sur CPU.

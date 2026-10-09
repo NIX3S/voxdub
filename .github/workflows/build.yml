@@ -1,0 +1,79 @@
+name: build
+
+# Compile VoxDub natively on Windows, macOS and Linux, and publish the three
+# binaries (+ scripts/ + README) as downloadable artifacts.
+#
+# How to use:
+#   1. Push this repo to GitHub.
+#   2. Go to the "Actions" tab -> "build" workflow -> "Run workflow"
+#      (or just push a commit / open a PR: it runs automatically).
+#   3. Once green, open the run, scroll to "Artifacts": download
+#      voxdub-windows-x64.zip / voxdub-macos-x64.zip / voxdub-macos-arm64.zip
+#      / voxdub-linux-x64.zip.
+#
+# This only builds the Rust app. whisper-cli and the Whisper model are NOT
+# bundled (different license, and users should pick their own model size) —
+# see the README for where to download them.
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+  workflow_dispatch:
+
+jobs:
+  build:
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - os: windows-latest
+            artifact: voxdub-windows-x64
+            bin_name: voxdub.exe
+          - os: macos-latest
+            artifact: voxdub-macos-arm64
+            bin_name: voxdub
+          - os: macos-13 # Intel runner
+            artifact: voxdub-macos-x64
+            bin_name: voxdub
+          - os: ubuntu-latest
+            artifact: voxdub-linux-x64
+            bin_name: voxdub
+
+    runs-on: ${{ matrix.os }}
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install Linux GUI/audio dev packages
+        if: runner.os == 'Linux'
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y \
+            libgtk-3-dev libxkbcommon-dev libssl-dev \
+            libasound2-dev pkg-config
+
+      - name: Install Rust toolchain
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: Cache cargo registry & build
+        uses: Swatinem/rust-cache@v2
+
+      - name: Build (release)
+        run: cargo build --release
+
+      - name: Stage artifact contents
+        shell: bash
+        run: |
+          set -e
+          mkdir -p dist
+          cp "target/release/${{ matrix.bin_name }}" dist/
+          cp -r scripts dist/
+          cp README.md dist/
+
+      - name: Upload artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: ${{ matrix.artifact }}
+          path: dist/
+          if-no-files-found: error
