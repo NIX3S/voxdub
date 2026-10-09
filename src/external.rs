@@ -100,6 +100,15 @@ struct CloneResultLine {
     error: Option<String>,
 }
 
+/// The one-off line clone_tts.py emits right after loading the model,
+/// reporting which device ("cuda" or "cpu") it actually landed on — so the
+/// caller can tell the user when a GPU was requested but not obtained,
+/// instead of it failing silently.
+#[derive(Deserialize)]
+struct DeviceLine {
+    device: String,
+}
+
 /// Calls scripts/clone_tts.py (Coqui XTTS-v2, fully offline) to synthesize
 /// an ENTIRE file's worth of segments in ONE Python process / ONE model
 /// load, instead of spawning a fresh process (and reloading the ~2GB XTTS
@@ -121,6 +130,7 @@ pub fn clone_tts_batch(
     use_gpu: bool,
     low_priority: bool,
     on_result: &mut dyn FnMut(usize, Result<PathBuf>),
+    on_device: &mut dyn FnMut(&str),
 ) -> Result<()> {
     let req = CloneBatchReq {
         lang,
@@ -183,6 +193,10 @@ pub fn clone_tts_batch(
         let line = line.context("failed to read clone_tts.py output")?;
         let line = line.trim();
         if line.is_empty() {
+            continue;
+        }
+        if let Ok(dev) = serde_json::from_str::<DeviceLine>(line) {
+            on_device(&dev.device);
             continue;
         }
         let parsed: CloneResultLine = match serde_json::from_str(line) {

@@ -236,6 +236,11 @@ impl VoxDubApp {
                         j.stage = Stage::Error(msg);
                     }
                 }
+                PipelineMsg::Log(idx, msg) => {
+                    if let Some(j) = self.jobs.get_mut(idx) {
+                        j.last_log = Some(msg);
+                    }
+                }
             }
         }
     }
@@ -279,6 +284,7 @@ impl VoxDubApp {
         let settings = self.settings.clone();
         let tx = self.tx.clone();
         self.jobs[idx].stage = Stage::Converting;
+        self.jobs[idx].last_log = None;
         self.dirty = true;
         std::thread::spawn(move || {
             pipeline::run_transcription(idx, input_path, voice_override, settings, tx);
@@ -916,6 +922,14 @@ impl VoxDubApp {
                  l'étape de validation) ; le changer après que la voix a déjà été générée n'a \
                  d'effet qu'en relançant un traitement depuis le début.",
             );
+        }
+        if let Some(log) = self.jobs[idx].last_log.clone() {
+            let color = if log.starts_with('⚠') {
+                egui::Color32::YELLOW
+            } else {
+                egui::Color32::GRAY
+            };
+            ui.colored_label(color, log);
         }
         ui.separator();
 

@@ -164,6 +164,7 @@ pub fn run_synthesis(
         let mut raw_by_index: HashMap<usize, PathBuf> = HashMap::new();
         let mut synth_errors: Vec<String> = Vec::new();
         let mut done_count = 0usize;
+        let mut device_used: Option<String> = None;
 
         external::clone_tts_batch(
             &settings.python_bin,
@@ -184,8 +185,33 @@ pub fn run_synthesis(
                 tx.send(PipelineMsg::SynthesisProgress(job_idx, done_count, total))
                     .ok();
             },
+            &mut |dev| device_used = Some(dev.to_string()),
         )
         .context("voice synthesis batch failed")?;
+
+        // Fais savoir à l'utilisateur, dans l'app, sur quel device la
+        // synthèse a réellement tourné — sans ça, un GPU demandé mais pas
+        // obtenu (torch CPU-only installé, par ex.) retombe sur CPU en
+        // silence et rien ne le signale.
+        match device_used.as_deref() {
+            Some("cuda") if settings.use_gpu => {
+                tx.send(PipelineMsg::Log(job_idx, "🟢 Synthèse vocale : GPU (CUDA) utilisé.".into()))
+                    .ok();
+            }
+            Some(other) if settings.use_gpu => {
+                tx.send(PipelineMsg::Log(
+                    job_idx,
+                    format!(
+                        "⚠ GPU demandé mais la synthèse a tourné sur « {other} ». \
+                         Vérifie qu'un torch avec support CUDA est bien installé \
+                         (voir README § Performance) : \
+                         python -c \"import torch; print(torch.__version__, torch.version.cuda, torch.cuda.is_available())\""
+                    ),
+                ))
+                .ok();
+            }
+            _ => {}
+        }
 
         if !synth_errors.is_empty() {
             bail!(

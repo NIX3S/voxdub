@@ -332,6 +332,26 @@ Trois réglages dans le panneau Réglages, sous « Performance / gros batchs » 
   du binaire whisper-cli téléchargé (cuBLAS/Vulkan) qui compte, pas un
   réglage ici — voir §⚠️ en haut.
 
+  Depuis la synthèse, l'app affiche maintenant dans l'onglet du fichier
+  concerné une ligne indiquant le device réellement utilisé (🟢 GPU, ou ⚠
+  CPU si le GPU était demandé mais pas obtenu). **La cause la plus
+  fréquente d'un XTTS qui reste bloqué sur CPU malgré la case cochée** :
+  `pip install TTS` installe `torch` comme dépendance, et sur Windows ça
+  installe par défaut une build **CPU-only**, même si tu as déjà fait
+  `pip install torch --index-url .../cu121` plus tôt (une réinstallation ou
+  un ordre d'installation différent peut l'écraser avec la version CPU).
+  Vérifie avec :
+  ```bash
+  python -c "import torch; print(torch.__version__, torch.version.cuda, torch.cuda.is_available())"
+  ```
+  Si `torch.version.cuda` affiche `None` ou si `torch.cuda.is_available()`
+  est `False`, réinstalle en forçant la build CUDA (adapte `cu121` à ta
+  version de CUDA Toolkit, et fais-le **en dernier**, après `pip install -r
+  requirements.txt`, pour être sûr que rien ne la réécrase ensuite) :
+  ```bash
+  pip install --force-reinstall torch --index-url https://download.pytorch.org/whl/cu121
+  ```
+
 **Le changement qui compte le plus** pour un très gros volume n'est même pas
 dans ces réglages : la version précédente relançait un processus Python (et
 rechargeait le modèle XTTS, ~2 Go, 10-30s+) **à chaque segment**. Avec des

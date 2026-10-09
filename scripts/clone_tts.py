@@ -123,15 +123,50 @@ def main() -> None:
     speaker = request["speaker"]
     items = request["items"]  # [{"text": ..., "out": ...}, ...]
 
-    use_gpu = bool(args.gpu) and torch.cuda.is_available()
-    if args.gpu and not use_gpu:
+    cuda_ok = torch.cuda.is_available()
+    print(
+        f"[voxdub] torch={torch.__version__}  torch_cuda_build={torch.version.cuda}  "
+        f"cuda_available={cuda_ok}",
+        file=sys.stderr,
+    )
+    if cuda_ok:
+        try:
+            print(f"[voxdub] GPU detecte : {torch.cuda.get_device_name(0)}", file=sys.stderr)
+        except Exception as e:  # pragma: no cover - purely informational
+            print(f"[voxdub] GPU detecte mais nom illisible : {e}", file=sys.stderr)
+    elif args.gpu:
         print(
-            "GPU demande mais aucun CUDA detecte par torch (driver/torch-cuda "
-            "manquant ?) : retour au CPU.",
+            "[voxdub] --gpu demande mais torch.cuda.is_available() = False. Cause la plus "
+            "frequente : le torch installe est une build CPU-ONLY (c'est ce que "
+            "'pip install torch' installe par defaut sur Windows, meme si 'TTS' l'a deja "
+            "installe comme dependance). Verifie avec : "
+            "python -c \"import torch; print(torch.__version__, torch.version.cuda, torch.cuda.is_available())\" "
+            "-- si torch.version.cuda affiche None, reinstalle avec : "
+            "pip install --force-reinstall torch --index-url https://download.pytorch.org/whl/cu121 "
+            "(adapte cu121 a ta version CUDA). Voir le README.",
             file=sys.stderr,
         )
 
-    tts = TTS(MODEL_NAME, gpu=use_gpu)
+    use_gpu = bool(args.gpu) and cuda_ok
+    device = "cuda" if use_gpu else "cpu"
+
+    # NOTE: le kwarg historique `TTS(model, gpu=True)` est peu fiable selon
+    # la version de coqui-tts/TTS installee (silencieusement ignore sur
+    # certaines versions) ; `.to(device)` explicite est la facon documentee
+    # et fiable de placer le modele sur le GPU.
+    tts = TTS(MODEL_NAME)
+    try:
+        tts = tts.to(device)
+    except Exception as e:
+        print(f"[voxdub] echec de chargement sur {device} ({e}) : repli sur CPU.", file=sys.stderr)
+        device = "cpu"
+        tts = tts.to(device)
+
+    print(f"[voxdub] XTTS charge sur : {device}", file=sys.stderr)
+    # Ligne structuree (stdout, pas stderr) que le cote Rust peut parser pour
+    # afficher dans l'app quel device a vraiment ete utilise, meme quand tout
+    # se passe bien (le stderr n'est normalement affiche qu'en cas d'echec).
+    emit({"device": device})
 
     for i, item in enumerate(items):
         text = item["text"]

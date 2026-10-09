@@ -84,6 +84,11 @@ pub struct FileJob {
     /// (lui-même "depuis l'entrée" par défaut, ou une voix dédiée globale).
     #[serde(default)]
     pub voice_override: Option<PathBuf>,
+    /// Dernier message informatif reçu pour ce job (ex: "XTTS a tourné sur :
+    /// cpu"), affiché dans son onglet. Pas persisté (purement diagnostic de
+    /// la session en cours), remis à zéro à chaque relance de traitement.
+    #[serde(skip, default)]
+    pub last_log: Option<String>,
 }
 
 impl FileJob {
@@ -97,6 +102,7 @@ impl FileJob {
             original_duration: None,
             output_duration: None,
             voice_override: None,
+            last_log: None,
         }
     }
 
@@ -204,4 +210,7 @@ pub enum PipelineMsg {
     /// job_idx, original_duration_s, output_duration_s
     FileDurations(usize, f32, f32),
     Error(usize, String),
+    /// job_idx, message — informational, non-fatal (e.g. which device XTTS
+    /// actually ran on), shown in the UI without ending the job's stage.
+    Log(usize, String),
 }
