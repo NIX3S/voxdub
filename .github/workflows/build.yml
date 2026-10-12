@@ -1,23 +1,9 @@
 name: build
 
-# Compile VoxDub natively on Windows, macOS and Linux, and publish the three
-# binaries (+ scripts/ + README) as downloadable artifacts.
-#
-# How to use:
-#   1. Push this repo to GitHub.
-#   2. Go to the "Actions" tab -> "build" workflow -> "Run workflow"
-#      (or just push a commit / open a PR: it runs automatically).
-#   3. Once green, open the run, scroll to "Artifacts": download
-#      voxdub-windows-x64.zip / voxdub-macos-x64.zip / voxdub-macos-arm64.zip
-#      / voxdub-linux-x64.zip.
-#
-# This only builds the Rust app. whisper-cli and the Whisper model are NOT
-# bundled (different license, and users should pick their own model size) —
-# see the README for where to download them.
-
 on:
   push:
     branches: [main]
+    tags: ['v*'] # Déclenche le workflow lors de la création d'un tag (ex: v1.0.0)
   pull_request:
   workflow_dispatch:
 
@@ -65,8 +51,8 @@ jobs:
           set -e
           mkdir -p dist
           cp "target/release/${{ matrix.bin_name }}" dist/
-          cp -r scripts dist/
-          cp README.md dist/
+          [ -d scripts ] && cp -r scripts dist/ || echo "Pas de dossier scripts"
+          [ -f README.md ] && cp README.md dist/ || echo "Pas de README.md"
 
       - name: Upload artifact
         uses: actions/upload-artifact@v4
@@ -74,3 +60,37 @@ jobs:
           name: ${{ matrix.artifact }}
           path: dist/
           if-no-files-found: error
+
+  # --- NOUVEAU JOB POUR LA RELEASE ---
+  release:
+    name: Create GitHub Release
+    needs: build
+    if: startsWith(github.ref, 'refs/tags/v') # S'exécute uniquement si c'est un tag v*
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write # Requis pour créer une release et y attacher des fichiers
+
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Download all artifacts
+        uses: actions/download-artifact@v4
+        with:
+          path: artifacts # Télécharge tous les artefacts dans ce dossier
+
+      - name: Zip artifacts for release
+        run: |
+          mkdir release_assets
+          cd artifacts
+          for dir in */; do
+            zip -r "../release_assets/${dir%/}.zip" "$dir"
+          done
+
+      - name: Create GitHub Release and Upload Assets
+        uses: softprops/action-gh-release@v2
+        with:
+          files: release_assets/*.zip
+          generate_release_notes: true # Génère automatiquement le changelog basé sur les PRs/commits
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
