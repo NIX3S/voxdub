@@ -1,8 +1,10 @@
 use anyhow::{anyhow, bail, Context, Result};
 use serde::{Deserialize, Serialize};
-use std::io::{BufRead, BufReader, Read, Write};
+use std::collections::VecDeque;
+use std::io::{BufRead, BufReader, Write};
 use std::path::{Path, PathBuf};
-use std::process::Stdio;
+use std::process::{Child, ChildStdin, ChildStdout, Stdio};
+use std::sync::{Arc, Mutex};
 
 use crate::proc_util::command_with_priority;
 
@@ -86,143 +88,315 @@ struct CloneItemReq<'a> {
 }
 
 #[derive(Serialize)]
-struct CloneBatchReq<'a> {
+struct CloneFileReq<'a> {
+    req_id: u64,
     lang: &'a str,
     speaker: String,
     items: Vec<CloneItemReq<'a>>,
 }
 
-#[derive(Deserialize)]
-struct CloneResultLine {
-    index: usize,
-    ok: bool,
+/// One line of clone_tts.py's persistent-worker protocol: either the
+/// one-off device announcement right after model load, a per-segment
+/// result, the "this file is done" marker, or a fatal error. Fields are all
+/// optional because which ones are present depends on which kind of line
+/// it is — there's no tag, callers just check what's `Some`.
+#[derive(Deserialize, Default)]
+struct WorkerLine {
+    device: Option<String>,
+    index: Option<usize>,
+    ok: Option<bool>,
     out: Option<String>,
     error: Option<String>,
+    done: Option<bool>,
+    fatal: Option<String>,
 }
 
-/// The one-off line clone_tts.py emits right after loading the model,
-/// reporting which device ("cuda" or "cpu") it actually landed on — so the
-/// caller can tell the user when a GPU was requested but not obtained,
-/// instead of it failing silently.
-#[derive(Deserialize)]
-struct DeviceLine {
-    device: String,
+const STDERR_TAIL_LINES: usize = 200;
+
+/// A long-lived `clone_tts.py` subprocess that loads the XTTS model ONCE
+/// and then stays alive to synthesize many files one after another, over a
+/// small newline-delimited JSON protocol on stdin/stdout — instead of the
+/// previous design, which spawned a fresh Python process (reloading the
+/// ~2GB model, 10-30s+) for every single FILE. With thousands of files in a
+/// batch, that per-file reload cost alone could dwarf actual synthesis
+/// time; keeping one worker alive per `max_parallel` "slot" for the whole
+/// batch amortizes the load to (ideally) once per slot instead of once per
+/// file. One segment-level model reload per file was already eliminated
+/// earlier (see the git history / README) — this removes the next layer.
+pub struct CloneWorker {
+    child: Child,
+    /// `None` once `run_file` detects the process is dead/misbehaving, so
+    /// the caller knows to stop reusing this worker and spawn a fresh one.
+    stdin: Option<ChildStdin>,
+    stdout: BufReader<ChildStdout>,
+    stderr_tail: Arc<Mutex<VecDeque<String>>>,
+    /// "cuda" or "cpu" — captured once right after the model finished
+    /// loading. Fixed for the worker's whole lifetime (a process can't
+    /// change device mid-run), so every file it processes reuses this
+    /// instead of re-parsing a device line each time.
+    pub device: String,
 }
 
-/// Calls scripts/clone_tts.py (Coqui XTTS-v2, fully offline) to synthesize
-/// an ENTIRE file's worth of segments in ONE Python process / ONE model
-/// load, instead of spawning a fresh process (and reloading the ~2GB XTTS
-/// model, which can take 10-30s+) for every single segment. This was the
-/// single biggest performance bottleneck in the per-segment version: with
-/// dozens of segments per file across thousands of files, the model reload
-/// overhead alone could dwarf actual synthesis time.
-///
-/// `items`: (text, output_wav_path) pairs, in segment order.
-/// `on_result` is called once per segment AS IT COMPLETES (the script
-/// streams one JSON result line per segment to stdout), so the caller can
-/// still report live per-segment progress.
-pub fn clone_tts_batch(
-    python_bin: &str,
-    script_path: &Path,
-    items: &[(String, PathBuf)],
-    lang: &str,
-    speaker_wav: &Path,
-    use_gpu: bool,
-    low_priority: bool,
-    on_result: &mut dyn FnMut(usize, Result<PathBuf>),
-    on_device: &mut dyn FnMut(&str),
-) -> Result<()> {
-    let req = CloneBatchReq {
-        lang,
-        speaker: speaker_wav.to_string_lossy().to_string(),
-        items: items
-            .iter()
-            .map(|(t, p)| CloneItemReq {
-                text: t,
-                out: p.to_string_lossy().to_string(),
-            })
-            .collect(),
-    };
-    let payload = serde_json::to_vec(&req)?;
-
-    let script_str = script_path
-        .to_str()
-        .context("le chemin de clone_tts.py n'est pas de l'UTF-8 valide")?;
-    let mut script_args: Vec<&str> = vec![script_str];
-    if use_gpu {
-        script_args.push("--gpu");
-    }
-
-    let mut cmd = command_with_priority(python_bin, &script_args, low_priority);
-    cmd.stdin(Stdio::piped())
-        .stdout(Stdio::piped())
-        .stderr(Stdio::piped());
-    configure_utf8(&mut cmd);
-
-    let mut child = cmd
-        .spawn()
-        .with_context(|| format!("failed to launch {python_bin} {script_path:?}"))?;
-
-    let mut stdin = child
-        .stdin
-        .take()
-        .context("no stdin on clone_tts.py child")?;
-    let writer = std::thread::spawn(move || {
-        // Errors here surface anyway via the exit status / stderr below.
-        let _ = stdin.write_all(&payload);
-        // `stdin` drops at the end of this closure, closing the pipe and
-        // signaling EOF to Python so it can start processing.
-    });
-
-    let mut stderr_pipe = child
-        .stderr
-        .take()
-        .context("no stderr on clone_tts.py child")?;
-    let stderr_reader = std::thread::spawn(move || {
-        let mut buf = String::new();
-        let _ = stderr_pipe.read_to_string(&mut buf);
-        buf
-    });
-
-    let stdout = child
-        .stdout
-        .take()
-        .context("no stdout on clone_tts.py child")?;
-    let reader = BufReader::new(stdout);
-    for line in reader.lines() {
-        let line = line.context("failed to read clone_tts.py output")?;
-        let line = line.trim();
-        if line.is_empty() {
-            continue;
+impl CloneWorker {
+    /// Spawns clone_tts.py and blocks until it reports the device it loaded
+    /// the model on (or dies trying) — i.e. this returns only once the
+    /// (potentially slow, 10-30s+, or much longer on first run / slow CPU)
+    /// model load has finished.
+    ///
+    /// `on_log` is called with every stderr line clone_tts.py prints WHILE
+    /// loading (torch/CUDA diagnostics, download progress, the CPML-license
+    /// notice, ...), as it happens — not just dumped after the fact on
+    /// failure — so the caller can forward it to the UI and the user isn't
+    /// staring at a frozen "chargement…" message with zero information for
+    /// however long this takes.
+    pub fn spawn(
+        python_bin: &str,
+        script_path: &Path,
+        use_gpu: bool,
+        low_priority: bool,
+        on_log: &mut dyn FnMut(&str),
+    ) -> Result<Self> {
+        let script_str = script_path
+            .to_str()
+            .context("le chemin de clone_tts.py n'est pas de l'UTF-8 valide")?;
+        let mut script_args: Vec<&str> = vec![script_str];
+        if use_gpu {
+            script_args.push("--gpu");
         }
-        if let Ok(dev) = serde_json::from_str::<DeviceLine>(line) {
-            on_device(&dev.device);
-            continue;
+
+        let mut cmd = command_with_priority(python_bin, &script_args, low_priority);
+        cmd.stdin(Stdio::piped())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped());
+        configure_utf8(&mut cmd);
+        // Coqui TTS gates the XTTS-v2 model (non-commercial CPML license)
+        // behind an interactive confirmation prompt (`input()`) the very
+        // first time it's loaded. Our stdin is a pipe, not a real terminal,
+        // so that prompt would block forever waiting for a keystroke that
+        // can never arrive — this is the documented opt-out (clone_tts.py
+        // also sets this itself, and patches `input()` as a further
+        // fallback, in case some other prompt shows up).
+        cmd.env("COQUI_TOS_AGREED", "1");
+
+        let mut child = cmd
+            .spawn()
+            .with_context(|| format!("failed to launch {python_bin} {script_path:?}"))?;
+
+        let stdin = child.stdin.take().context("no stdin on clone_tts.py child")?;
+        let stdout = child.stdout.take().context("no stdout on clone_tts.py child")?;
+        let mut stdout = BufReader::new(stdout);
+
+        let stderr_pipe = child.stderr.take().context("no stderr on clone_tts.py child")?;
+        let stderr_tail: Arc<Mutex<VecDeque<String>>> = Arc::new(Mutex::new(VecDeque::new()));
+        // Every stderr line also goes out on this channel, live, so the
+        // startup loop below can forward it to `on_log` as it arrives
+        // instead of only after the fact.
+        let (log_tx, log_rx) = std::sync::mpsc::channel::<String>();
+        {
+            let stderr_tail = stderr_tail.clone();
+            std::thread::spawn(move || {
+                let reader = BufReader::new(stderr_pipe);
+                for line in reader.lines().map_while(std::io::Result::ok) {
+                    let mut buf = stderr_tail.lock().unwrap();
+                    if buf.len() >= STDERR_TAIL_LINES {
+                        buf.pop_front();
+                    }
+                    buf.push_back(line.clone());
+                    drop(buf);
+                    let _ = log_tx.send(line);
+                }
+            });
         }
-        let parsed: CloneResultLine = match serde_json::from_str(line) {
-            Ok(p) => p,
-            Err(_) => continue, // stray non-JSON line (shouldn't happen, ignore defensively)
+
+        // The device-line read is a blocking call, so it runs on its own
+        // thread; this lets the loop below keep forwarding stderr lines
+        // (via `log_rx`) to `on_log` WHILE that blocking read is still in
+        // progress, instead of only being able to show anything once it's
+        // already finished (or failed). On success the thread hands back
+        // `stdout` itself (it owns it temporarily), so the caller can keep
+        // using it afterwards for `run_file`.
+        type DeviceOutcome = Result<(String, BufReader<ChildStdout>), String>;
+        let (device_tx, device_rx) = std::sync::mpsc::channel::<DeviceOutcome>();
+        {
+            let stderr_tail = stderr_tail.clone();
+            std::thread::spawn(move || {
+                let result: DeviceOutcome = (|| {
+                    loop {
+                        let mut raw = String::new();
+                        let n = stdout
+                            .read_line(&mut raw)
+                            .map_err(|e| format!("lecture interrompue : {e}"))?;
+                        if n == 0 {
+                            return Err(format!(
+                                "clone_tts.py s'est arrêté avant d'avoir fini de charger le modèle :\n{}",
+                                Self::tail_text(&stderr_tail)
+                            ));
+                        }
+                        let raw = raw.trim();
+                        if raw.is_empty() {
+                            continue;
+                        }
+                        let parsed: WorkerLine = serde_json::from_str(raw).unwrap_or_default();
+                        if let Some(d) = parsed.device {
+                            return Ok((d, stdout));
+                        }
+                        // anything else before the device line is unexpected; ignore defensively
+                    }
+                })();
+                let _ = device_tx.send(result);
+            });
+        }
+
+        // Interleave: forward stderr lines to `on_log` as they arrive,
+        // while waiting (with no overall timeout — a first-run model
+        // download can legitimately take several minutes) for the
+        // device-ready signal from the thread above.
+        let (device, stdout) = loop {
+            match device_rx.try_recv() {
+                Ok(Ok(pair)) => break pair,
+                Ok(Err(e)) => bail!("{e}"),
+                Err(std::sync::mpsc::TryRecvError::Disconnected) => {
+                    bail!(
+                        "clone_tts.py s'est arrêté de façon inattendue pendant le chargement :\n{}",
+                        Self::tail_text(&stderr_tail)
+                    );
+                }
+                Err(std::sync::mpsc::TryRecvError::Empty) => {}
+            }
+            match log_rx.recv_timeout(std::time::Duration::from_millis(300)) {
+                Ok(line) => on_log(&line),
+                Err(std::sync::mpsc::RecvTimeoutError::Timeout) => continue,
+                // stderr pipe closed (process likely dying/dead): keep
+                // looping on `device_rx`, which will report the real
+                // outcome (success or the process having died) shortly.
+                Err(std::sync::mpsc::RecvTimeoutError::Disconnected) => match device_rx.recv() {
+                    Ok(Ok(pair)) => break pair,
+                    Ok(Err(e)) => bail!("{e}"),
+                    Err(_) => bail!(
+                        "clone_tts.py s'est arrêté de façon inattendue pendant le chargement :\n{}",
+                        Self::tail_text(&stderr_tail)
+                    ),
+                },
+            }
         };
-        if parsed.ok {
-            let path = PathBuf::from(parsed.out.unwrap_or_default());
-            on_result(parsed.index, Ok(path));
-        } else {
-            on_result(
-                parsed.index,
-                Err(anyhow!(parsed.error.unwrap_or_else(|| "erreur inconnue".into()))),
-            );
-        }
+
+        Ok(Self {
+            child,
+            stdin: Some(stdin),
+            stdout,
+            stderr_tail,
+            device,
+        })
     }
 
-    let _ = writer.join();
-    let stderr_buf = stderr_reader.join().unwrap_or_default();
-    let status = child
-        .wait()
-        .context("failed to wait on clone_tts.py")?;
-    if !status.success() {
-        let lines: Vec<&str> = stderr_buf.lines().collect();
-        let tail = lines[lines.len().saturating_sub(12)..].join("\n");
-        bail!("clone_tts.py a échoué ({status}):\n{tail}");
+    fn tail_text(buf: &Mutex<VecDeque<String>>) -> String {
+        buf.lock().unwrap().iter().cloned().collect::<Vec<_>>().join("\n")
     }
-    Ok(())
+
+    /// Runs ONE file's worth of segments through the already-loaded model.
+    /// Blocks until this file's results have all streamed back — the
+    /// Python side fully finishes one file before reading its next request
+    /// line, so this is a simple synchronous round-trip from here.
+    ///
+    /// `items`: (text, output_wav_path) pairs, in segment order.
+    /// `on_result` is called once per segment AS IT COMPLETES, so the
+    /// caller can still report live per-segment progress.
+    pub fn run_file(
+        &mut self,
+        req_id: u64,
+        lang: &str,
+        speaker_wav: &Path,
+        items: &[(String, PathBuf)],
+        on_result: &mut dyn FnMut(usize, Result<PathBuf>),
+    ) -> Result<()> {
+        let req = CloneFileReq {
+            req_id,
+            lang,
+            speaker: speaker_wav.to_string_lossy().to_string(),
+            items: items
+                .iter()
+                .map(|(t, p)| CloneItemReq {
+                    text: t,
+                    out: p.to_string_lossy().to_string(),
+                })
+                .collect(),
+        };
+        let mut line = serde_json::to_vec(&req)?;
+        line.push(b'\n');
+
+        if self.stdin.is_none() {
+            bail!("worker clone_tts.py déjà arrêté");
+        }
+        // Scoped so the mutable borrow of `self.stdin` is fully released
+        // before we potentially need to write to `self.stdin` again (set it
+        // to `None`) in the error branch below.
+        let write_result = {
+            let stdin = self.stdin.as_mut().unwrap();
+            stdin.write_all(&line).and_then(|_| stdin.flush())
+        };
+        if let Err(e) = write_result {
+            self.stdin = None; // process is gone, don't try to reuse this worker
+            bail!("échec d'écriture vers clone_tts.py (process mort ?) : {e}");
+        }
+
+        loop {
+            let mut raw = String::new();
+            let n = self.stdout.read_line(&mut raw);
+            let n = match n {
+                Ok(n) => n,
+                Err(e) => {
+                    self.stdin = None;
+                    bail!("lecture de clone_tts.py interrompue (process mort ?) : {e}");
+                }
+            };
+            if n == 0 {
+                self.stdin = None;
+                bail!(
+                    "clone_tts.py s'est arrêté de façon inattendue :\n{}",
+                    Self::tail_text(&self.stderr_tail)
+                );
+            }
+            let raw = raw.trim();
+            if raw.is_empty() {
+                continue;
+            }
+            let parsed: WorkerLine = match serde_json::from_str(raw) {
+                Ok(p) => p,
+                Err(_) => continue, // stray non-JSON line, ignore defensively
+            };
+            if let Some(msg) = parsed.fatal {
+                self.stdin = None;
+                bail!("clone_tts.py: {msg}");
+            }
+            if parsed.done == Some(true) {
+                return Ok(());
+            }
+            if let (Some(index), Some(ok)) = (parsed.index, parsed.ok) {
+                if ok {
+                    on_result(index, Ok(PathBuf::from(parsed.out.unwrap_or_default())));
+                } else {
+                    on_result(
+                        index,
+                        Err(anyhow!(parsed.error.unwrap_or_else(|| "erreur inconnue".into()))),
+                    );
+                }
+            }
+        }
+    }
+}
+
+impl Drop for CloneWorker {
+    fn drop(&mut self) {
+        // Close stdin FIRST (before waiting): that's what signals EOF to
+        // the Python side's `for line in sys.stdin:` loop, letting it exit
+        // on its own. Waiting without doing this first would deadlock
+        // forever on a worker that's just idle, waiting for a next file
+        // that's never coming.
+        self.stdin.take();
+        // Reap the process so we don't leave it running in the background
+        // (still holding the model, and GPU memory if applicable) after
+        // this worker is no longer going to be used. Best-effort: if the
+        // process is somehow stuck exiting, this can block briefly.
+        let _ = self.child.wait();
+    }
 }

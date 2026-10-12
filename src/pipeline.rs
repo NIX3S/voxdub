@@ -130,50 +130,44 @@ pub fn run_translation(
 }
 
 /// Stage 3: synthesize each validated translated segment (voice cloning),
-/// then stitch them into the final output file. Synthesis now happens in
-/// ONE call to clone_tts.py covering the whole file (see
-/// `external::clone_tts_batch`), instead of one process per segment — that
-/// used to reload the ~2GB XTTS model for every single segment, which on a
-/// file with dozens of segments dwarfed actual synthesis time.
-pub fn run_synthesis(
+/// then stitch them into the final output file. Shared between the manual
+/// single-file path (`run_synthesis`, which spawns a one-shot worker) and
+/// the batch coordinator (which passes in a worker it keeps alive across
+/// many files — see `external::CloneWorker`).
+fn run_synthesis_with_worker(
     job_idx: usize,
     input_path: PathBuf,
     segments: Vec<Segment>,
     settings: Settings,
-    scripts_dir: PathBuf,
     tx: Sender<PipelineMsg>,
-) {
-    let result: Result<PathBuf> = (|| {
-        tx.send(PipelineMsg::Stage(job_idx, Stage::Synthesizing)).ok();
-        let dir = workdir_for(&input_path)?;
-        let speaker_ref = dir.join("speaker_ref.wav");
-        let clone_script = scripts_dir.join("clone_tts.py");
+    worker: &mut external::CloneWorker,
+) -> Result<PathBuf> {
+    tx.send(PipelineMsg::Stage(job_idx, Stage::Synthesizing)).ok();
+    let dir = workdir_for(&input_path)?;
+    let speaker_ref = dir.join("speaker_ref.wav");
 
-        let total = segments.len();
-        let items: Vec<(String, PathBuf)> = segments
-            .iter()
-            .enumerate()
-            .map(|(i, seg)| {
-                (
-                    seg.translated_text.clone(),
-                    dir.join(format!("seg_{i:04}_raw.wav")),
-                )
-            })
-            .collect();
+    let total = segments.len();
+    let items: Vec<(String, PathBuf)> = segments
+        .iter()
+        .enumerate()
+        .map(|(i, seg)| {
+            (
+                seg.translated_text.clone(),
+                dir.join(format!("seg_{i:04}_raw.wav")),
+            )
+        })
+        .collect();
 
-        let mut raw_by_index: HashMap<usize, PathBuf> = HashMap::new();
-        let mut synth_errors: Vec<String> = Vec::new();
-        let mut done_count = 0usize;
-        let mut device_used: Option<String> = None;
+    let mut raw_by_index: HashMap<usize, PathBuf> = HashMap::new();
+    let mut synth_errors: Vec<String> = Vec::new();
+    let mut done_count = 0usize;
 
-        external::clone_tts_batch(
-            &settings.python_bin,
-            &clone_script,
-            &items,
+    worker
+        .run_file(
+            job_idx as u64,
             &settings.target_lang,
             &speaker_ref,
-            settings.use_gpu,
-            settings.low_priority,
+            &items,
             &mut |i, res| {
                 done_count += 1;
                 match res {
@@ -185,118 +179,154 @@ pub fn run_synthesis(
                 tx.send(PipelineMsg::SynthesisProgress(job_idx, done_count, total))
                     .ok();
             },
-            &mut |dev| device_used = Some(dev.to_string()),
         )
-        .context("voice synthesis batch failed")?;
+        .context("voice synthesis failed")?;
 
-        // Fais savoir à l'utilisateur, dans l'app, sur quel device la
-        // synthèse a réellement tourné — sans ça, un GPU demandé mais pas
-        // obtenu (torch CPU-only installé, par ex.) retombe sur CPU en
-        // silence et rien ne le signale.
-        match device_used.as_deref() {
-            Some("cuda") if settings.use_gpu => {
-                tx.send(PipelineMsg::Log(job_idx, "🟢 Synthèse vocale : GPU (CUDA) utilisé.".into()))
-                    .ok();
-            }
-            Some(other) if settings.use_gpu => {
-                tx.send(PipelineMsg::Log(
-                    job_idx,
-                    format!(
-                        "⚠ GPU demandé mais la synthèse a tourné sur « {other} ». \
-                         Vérifie qu'un torch avec support CUDA est bien installé \
-                         (voir README § Performance) : \
-                         python -c \"import torch; print(torch.__version__, torch.version.cuda, torch.cuda.is_available())\""
-                    ),
-                ))
+    // Fais savoir à l'utilisateur, dans l'app, sur quel device la synthèse
+    // a réellement tourné — sans ça, un GPU demandé mais pas obtenu (torch
+    // CPU-only installé, par ex.) retombe sur CPU en silence et rien ne le
+    // signale. `worker.device` est fixé une fois pour toutes au chargement
+    // du modèle, donc identique pour tous les fichiers que ce worker traite.
+    match worker.device.as_str() {
+        "cuda" if settings.use_gpu => {
+            tx.send(PipelineMsg::Log(job_idx, "🟢 Synthèse vocale : GPU (CUDA) utilisé.".into()))
                 .ok();
-            }
-            _ => {}
         }
-
-        if !synth_errors.is_empty() {
-            bail!(
-                "échec de synthèse sur {} segment(s) : {}",
-                synth_errors.len(),
-                synth_errors.join("; ")
-            );
-        }
-
-        let mut clip_paths: Vec<(PathBuf, f32)> = Vec::with_capacity(total);
-        for (i, seg) in segments.iter().enumerate() {
-            let raw_clip = raw_by_index
-                .remove(&i)
-                .with_context(|| format!("segment {i} manquant en sortie de synthèse"))?;
-
-            let final_clip = match settings.output_mode {
-                OutputMode::FitOriginalDuration => {
-                    let fitted = dir.join(format!("seg_{i:04}_fit.wav"));
-                    audio::stretch_to_duration(&raw_clip, &fitted, seg.duration(), settings.low_priority)
-                        .with_context(|| format!("time-stretch failed for segment {i}"))?;
-                    fitted
-                }
-                OutputMode::JustTranslated => raw_clip,
-            };
-
-            let clip_duration = audio::probe_duration(&final_clip).unwrap_or(seg.duration() as f64) as f32;
-            tx.send(PipelineMsg::SegmentSynthesized(job_idx, i, final_clip.clone(), clip_duration))
-                .ok();
-            clip_paths.push((final_clip, seg.start));
-        }
-
-        tx.send(PipelineMsg::Stage(job_idx, Stage::Stitching)).ok();
-
-        let out_dir = settings
-            .output_dir
-            .clone()
-            .context("no output folder configured (set it in Settings)")?;
-        std::fs::create_dir_all(&out_dir)?;
-        let stem = input_path
-            .file_stem()
-            .map(|s| s.to_string_lossy().to_string())
-            .unwrap_or_else(|| "output".to_string());
-
-        // Intermediate mix, always wav (stitching filters need a PCM target).
-        let stitched_wav = dir.join("stitched.wav");
-
-        match settings.output_mode {
-            OutputMode::FitOriginalDuration => {
-                let total_s = segments
-                    .last()
-                    .map(|s| s.end)
-                    .unwrap_or(0.0)
-                    .max(audio::probe_duration(&input_path).unwrap_or(0.0) as f32);
-                audio::stitch_on_timeline(&clip_paths, total_s, 24000, &stitched_wav, settings.low_priority)
-                    .context("stitching (timeline mix) failed")?;
-            }
-            OutputMode::JustTranslated => {
-                let just_paths: Vec<PathBuf> = clip_paths.into_iter().map(|(p, _)| p).collect();
-                audio::concat_sequential(&just_paths, &stitched_wav, &dir, settings.low_priority)
-                    .context("stitching (concat) failed")?;
-            }
-        }
-
-        // Deliver in the SAME format as the input file (ogg -> ogg, mp3 -> mp3, ...).
-        let target_ext = input_path
-            .extension()
-            .and_then(|e| e.to_str())
-            .unwrap_or("wav")
-            .to_lowercase();
-        let out_path = out_dir.join(format!("{stem}_{}.{target_ext}", settings.target_lang));
-        if target_ext == "wav" {
-            std::fs::copy(&stitched_wav, &out_path).context("copying final wav failed")?;
-        } else {
-            audio::transcode(&stitched_wav, &out_path, settings.low_priority).with_context(|| {
+        other if settings.use_gpu => {
+            tx.send(PipelineMsg::Log(
+                job_idx,
                 format!(
-                    "conversion to .{target_ext} failed (ton build ffmpeg a-t-il l'encodeur pour ce format ?)"
-                )
-            })?;
+                    "⚠ GPU demandé mais la synthèse a tourné sur « {other} ». \
+                     Vérifie qu'un torch avec support CUDA est bien installé \
+                     (voir README § Performance) : \
+                     python -c \"import torch; print(torch.__version__, torch.version.cuda, torch.cuda.is_available())\""
+                ),
+            ))
+            .ok();
         }
+        _ => {}
+    }
 
-        let orig_dur = audio::probe_duration(&input_path).unwrap_or(0.0) as f32;
-        let out_dur = audio::probe_duration(&out_path).unwrap_or(0.0) as f32;
-        tx.send(PipelineMsg::FileDurations(job_idx, orig_dur, out_dur)).ok();
+    if !synth_errors.is_empty() {
+        bail!(
+            "échec de synthèse sur {} segment(s) : {}",
+            synth_errors.len(),
+            synth_errors.join("; ")
+        );
+    }
 
-        Ok(out_path)
+    let mut clip_paths: Vec<(PathBuf, f32)> = Vec::with_capacity(total);
+    for (i, seg) in segments.iter().enumerate() {
+        let raw_clip = raw_by_index
+            .remove(&i)
+            .with_context(|| format!("segment {i} manquant en sortie de synthèse"))?;
+
+        let final_clip = match settings.output_mode {
+            OutputMode::FitOriginalDuration => {
+                let fitted = dir.join(format!("seg_{i:04}_fit.wav"));
+                audio::stretch_to_duration(&raw_clip, &fitted, seg.duration(), settings.low_priority)
+                    .with_context(|| format!("time-stretch failed for segment {i}"))?;
+                fitted
+            }
+            OutputMode::JustTranslated => raw_clip,
+        };
+
+        let clip_duration = audio::probe_duration(&final_clip).unwrap_or(seg.duration() as f64) as f32;
+        tx.send(PipelineMsg::SegmentSynthesized(job_idx, i, final_clip.clone(), clip_duration))
+            .ok();
+        clip_paths.push((final_clip, seg.start));
+    }
+
+    tx.send(PipelineMsg::Stage(job_idx, Stage::Stitching)).ok();
+
+    let out_dir = settings
+        .output_dir
+        .clone()
+        .context("no output folder configured (set it in Settings)")?;
+    std::fs::create_dir_all(&out_dir)?;
+    let stem = input_path
+        .file_stem()
+        .map(|s| s.to_string_lossy().to_string())
+        .unwrap_or_else(|| "output".to_string());
+
+    // Intermediate mix, always wav (stitching filters need a PCM target).
+    let stitched_wav = dir.join("stitched.wav");
+
+    match settings.output_mode {
+        OutputMode::FitOriginalDuration => {
+            let total_s = segments
+                .last()
+                .map(|s| s.end)
+                .unwrap_or(0.0)
+                .max(audio::probe_duration(&input_path).unwrap_or(0.0) as f32);
+            audio::stitch_on_timeline(&clip_paths, total_s, 24000, &stitched_wav, settings.low_priority)
+                .context("stitching (timeline mix) failed")?;
+        }
+        OutputMode::JustTranslated => {
+            let just_paths: Vec<PathBuf> = clip_paths.into_iter().map(|(p, _)| p).collect();
+            audio::concat_sequential(&just_paths, &stitched_wav, &dir, settings.low_priority)
+                .context("stitching (concat) failed")?;
+        }
+    }
+
+    // Deliver in the SAME format as the input file (ogg -> ogg, mp3 -> mp3, ...).
+    let target_ext = input_path
+        .extension()
+        .and_then(|e| e.to_str())
+        .unwrap_or("wav")
+        .to_lowercase();
+    let out_path = out_dir.join(format!("{stem}_{}.{target_ext}", settings.target_lang));
+    if target_ext == "wav" {
+        std::fs::copy(&stitched_wav, &out_path).context("copying final wav failed")?;
+    } else {
+        audio::transcode(&stitched_wav, &out_path, settings.low_priority).with_context(|| {
+            format!(
+                "conversion to .{target_ext} failed (ton build ffmpeg a-t-il l'encodeur pour ce format ?)"
+            )
+        })?;
+    }
+
+    let orig_dur = audio::probe_duration(&input_path).unwrap_or(0.0) as f32;
+    let out_dur = audio::probe_duration(&out_path).unwrap_or(0.0) as f32;
+    tx.send(PipelineMsg::FileDurations(job_idx, orig_dur, out_dur)).ok();
+
+    Ok(out_path)
+}
+
+/// Manual (non-batch) single-file entry point: spawns a one-shot XTTS
+/// worker just for this file, synthesizes + stitches, then lets the worker
+/// shut itself down (its `Drop` closes stdin and reaps the process) once
+/// this function returns. For the batch coordinator, which wants to keep
+/// one worker alive across many files instead, see `run_synthesis_with_worker`.
+pub fn run_synthesis(
+    job_idx: usize,
+    input_path: PathBuf,
+    segments: Vec<Segment>,
+    settings: Settings,
+    scripts_dir: PathBuf,
+    tx: Sender<PipelineMsg>,
+) {
+    // Envoyé ICI, avant le (potentiellement long, 10-30s+ voire plus au
+    // tout premier lancement le temps de télécharger le modèle de ~2 Go)
+    // chargement du modèle : sinon l'UI reste sur l'étape précédente sans
+    // rien afficher pendant tout ce temps, ce qui donne l'impression que
+    // l'app est bloquée alors qu'elle charge simplement XTTS.
+    tx.send(PipelineMsg::Stage(job_idx, Stage::Synthesizing)).ok();
+
+    let result: Result<PathBuf> = (|| {
+        let clone_script = scripts_dir.join("clone_tts.py");
+        let log_tx = tx.clone();
+        let mut worker = external::CloneWorker::spawn(
+            &settings.python_bin,
+            &clone_script,
+            settings.use_gpu,
+            settings.low_priority,
+            &mut |line| {
+                log_tx.send(PipelineMsg::Log(job_idx, format!("⏳ {line}"))).ok();
+            },
+        )
+        .context("échec du lancement de clone_tts.py")?;
+        run_synthesis_with_worker(job_idx, input_path, segments, settings, tx.clone(), &mut worker)
     })();
 
     match result {
@@ -559,13 +589,21 @@ pub fn run_batch(
     run_phase_with(&to_synthesize, max_parallel, &stop_flag, &pause_flag, || {
         let tx = tx.clone();
         let settings = settings.clone();
-        let scripts_dir = scripts_dir.clone();
+        let clone_script = scripts_dir.join("clone_tts.py");
         let translations = &translations;
         let path_by_idx = &path_by_idx;
         let pending = &pending;
         let validate_rx = &validate_rx;
         let stop_flag = &stop_flag;
         let pause_flag = &pause_flag;
+        // Persistent XTTS worker for THIS thread (one of up to
+        // `max_parallel`), spawned lazily on first use and then reused for
+        // every file this thread processes afterwards — the whole point
+        // being to pay the ~2GB model load ONCE per parallel "slot" instead
+        // of once per file. If a call reports the process died mid-batch,
+        // it's dropped here so the next file gets a freshly spawned one
+        // instead of repeating the same failure down the line.
+        let mut worker: Option<external::CloneWorker> = None;
         move |idx: usize| {
             let translated = translations.lock().unwrap().remove(&idx);
             let Some(translated) = translated else { return };
@@ -580,7 +618,42 @@ pub fn run_batch(
             } else {
                 translated
             };
-            run_synthesis(idx, path, input_segments, settings.clone(), scripts_dir.clone(), tx.clone());
+
+            tx.send(PipelineMsg::Stage(idx, Stage::Synthesizing)).ok();
+
+            if worker.is_none() {
+                let log_tx = tx.clone();
+                match external::CloneWorker::spawn(
+                    &settings.python_bin,
+                    &clone_script,
+                    settings.use_gpu,
+                    settings.low_priority,
+                    &mut |line| {
+                        log_tx.send(PipelineMsg::Log(idx, format!("⏳ {line}"))).ok();
+                    },
+                ) {
+                    Ok(w) => worker = Some(w),
+                    Err(e) => {
+                        tx.send(PipelineMsg::Error(idx, format!("échec du lancement de clone_tts.py : {e:#}")))
+                            .ok();
+                        return;
+                    }
+                }
+            }
+            let w = worker.as_mut().expect("worker just ensured Some above");
+
+            match run_synthesis_with_worker(idx, path, input_segments, settings.clone(), tx.clone(), w) {
+                Ok(out_path) => {
+                    tx.send(PipelineMsg::Stage(idx, Stage::Done(out_path))).ok();
+                }
+                Err(e) => {
+                    tx.send(PipelineMsg::Error(idx, format!("{e:#}"))).ok();
+                    // Don't assume the worker is still usable after a
+                    // failure — a fresh one will be spawned for the next
+                    // file on this thread instead of repeating the error.
+                    worker = None;
+                }
+            }
         }
     });
 }

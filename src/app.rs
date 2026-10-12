@@ -518,9 +518,29 @@ impl VoxDubApp {
         });
 
         ui.label("Interpréteur Python (avec argostranslate + TTS installés) :");
-        if ui.text_edit_singleline(&mut self.settings.python_bin).changed() {
-            self.dirty = true;
-        }
+        ui.horizontal(|ui| {
+            if ui.text_edit_singleline(&mut self.settings.python_bin).changed() {
+                self.dirty = true;
+            }
+            if ui.button("Choisir…").clicked() {
+                let mut dialog = rfd::FileDialog::new();
+                if cfg!(windows) {
+                    dialog = dialog.add_filter("python.exe", &["exe"]);
+                }
+                if let Some(p) = dialog.pick_file() {
+                    self.settings.python_bin = p.display().to_string();
+                    self.dirty = true;
+                }
+            }
+        });
+        ui.small(
+            "Chemin de python.exe (ou juste \"python\"/\"python3\" s'il est sur le PATH) : \
+             l'interpréteur GLOBAL de Windows convient très bien, tant que c'est CELUI-LÀ qui \
+             a reçu `pip install -r requirements.txt` (sinon utilise plutôt un venv dédié — \
+             voir le README). Préfère le bouton Choisir… à un copier-coller : un chemin collé \
+             depuis « Copier en tant que chemin d'accès » de l'explorateur Windows inclut des \
+             guillemets qui font planter le lancement (erreur 123).",
+        );
 
         ui.horizontal(|ui| {
             ui.label("Langue source :");
@@ -966,7 +986,14 @@ impl VoxDubApp {
                         ui.add(egui::ProgressBar::new(done as f32 / total.max(1) as f32));
                     }
                     None => {
-                        ui.label("Synthèse vocale… (chargement du modèle XTTS — peut prendre une minute)");
+                        ui.label(
+                            "Synthèse vocale… (chargement du modèle XTTS — généralement 10-30s, \
+                             mais peut prendre plusieurs minutes au tout premier lancement le \
+                             temps de télécharger le modèle, ~2 Go, et nettement plus long sur \
+                             CPU que sur GPU). Pas de barre de progression possible tant que le \
+                             modèle n'est pas chargé — ce n'est pas figé, c'est juste cette \
+                             étape-là qui prend du temps.",
+                        );
                     }
                 }
             }

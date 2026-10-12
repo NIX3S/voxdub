@@ -221,6 +221,16 @@ p.install_from_path(pkg.download())
 Le modèle XTTS-v2 (~2 Go) se télécharge automatiquement au premier appel de
 `scripts/clone_tts.py`, puis reste en cache localement.
 
+> **Licence du modèle XTTS-v2** : non-commerciale (CPML —
+> https://coqui.ai/cpml.txt). Coqui TTS demande normalement une confirmation
+> interactive au tout premier chargement ; comme VoxDub pilote Python en
+> pipe (pas un vrai terminal), `clone_tts.py` positionne automatiquement
+> `COQUI_TOS_AGREED=1` pour éviter que ce prompt reste bloqué indéfiniment
+> à attendre une frappe qui n'arrivera jamais (symptôme observé : l'étape
+> « Synthèse vocale… chargement du modèle » qui ne bouge plus pendant
+> plusieurs minutes, aussi bien en mode batch qu'en single-file). Utiliser
+> l'app vaut acceptation de cette licence.
+
 **Pour utiliser le GPU côté synthèse vocale** (case « Utiliser le GPU » dans
 les Réglages), installe en plus un torch avec support CUDA, par exemple
 (adapter à ta version CUDA) :
@@ -353,13 +363,24 @@ Trois réglages dans le panneau Réglages, sous « Performance / gros batchs » 
   ```
 
 **Le changement qui compte le plus** pour un très gros volume n'est même pas
-dans ces réglages : la version précédente relançait un processus Python (et
-rechargeait le modèle XTTS, ~2 Go, 10-30s+) **à chaque segment**. Avec des
-dizaines de segments par fichier, ça dominait largement le temps réel de
-synthèse. La synthèse se fait maintenant en **un seul** processus par
-fichier (qui charge le modèle une fois, puis traite tous ses segments à la
-suite) — à lui seul, ça devrait déjà réduire drastiquement le temps total,
-avant même de toucher au parallélisme ou au GPU.
+dans ces réglages. Il y a eu deux étapes :
+1. D'abord, arrêter de recharger le modèle XTTS (~2 Go, 10-30s+) **à chaque
+   segment** (un fichier de plusieurs dizaines de segments rechargeait le
+   modèle autant de fois) — en le rechargeant une seule fois **par fichier**
+   à la place.
+2. Maintenant, un cran plus loin : le process `clone_tts.py` reste **vivant
+   pour toute la durée du batch** et traite les fichiers les uns après les
+   autres sans jamais redémarrer. Le modèle n'est donc chargé **qu'une
+   seule fois par emplacement de parallélisme** (voir « Fichiers en
+   parallèle » ci-dessus), pas une fois par fichier : pour 5000 fichiers
+   avec `max_parallel = 1`, c'est 1 chargement du modèle au lieu de 5000.
+   Si un worker plante en cours de route, l'app en relance un neuf
+   automatiquement pour le fichier suivant (auto-guérison, aucune action
+   nécessaire).
+
+Autrement dit, un batch de plusieurs milliers de fichiers ne paie quasiment
+plus **aucun** rechargement de modèle une fois lancé — tout le temps passé
+est du temps de synthèse réel, pas de l'attente de chargement.
 
 ### Voix pour le clonage : depuis le fichier, ou une voix dédiée
 Par défaut, chaque fichier est doublé **avec sa propre voix**, extraite

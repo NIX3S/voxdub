@@ -1,27 +1,41 @@
 #!/usr/bin/env python3
 """
-Synthese vocale BATCH avec clonage de voix, offline, via Coqui TTS (XTTS-v2).
+Synthese vocale avec clonage de voix, offline, via Coqui TTS (XTTS-v2) —
+PROCESS PERSISTANT : charge le modele XTTS UNE SEULE FOIS au demarrage, puis
+reste vivant en traitant un FICHIER (plusieurs segments) a la fois, autant
+de fois que le process Rust appelant lui en envoie, jusqu'a ce que stdin se
+ferme (EOF).
 
-Charge le modele XTTS UNE SEULE FOIS pour tout un fichier, puis synthetise
-tous ses segments a la suite - au lieu de relancer un processus (et de
-RECHARGER le modele, ~2Go, 10-30s+) pour chaque segment individuellement.
-C'etait le principal goulot d'etranglement de performance de la version
-precedente : avec des dizaines de segments par fichier x des milliers de
-fichiers, le rechargement du modele dominait largement le temps total.
+Ca remplace un design precedent qui rechargeait deja le modele une fois par
+FICHIER plutot qu'une fois par SEGMENT (un premier gain), mais relancait
+quand meme un nouveau process Python (et donc un nouveau chargement du
+modele, ~2Go, 10-30s+) pour chaque fichier. Avec des milliers de fichiers
+dans un batch, ce cout de rechargement repete dominait encore largement le
+temps de synthese reel. Ici, un seul process reste ouvert et traite tous
+les fichiers qui lui sont confies a la suite : le modele n'est charge
+qu'UNE fois pour toute la duree de vie du process (un process par
+"emplacement" de parallelisme cote app, pas un par fichier).
 
-Entree, un seul JSON sur stdin:
-    {"lang": "en", "speaker": "/chemin/ref.wav",
-     "items": [{"text": "...", "out": "/chemin/seg0.wav"}, ...]}
+Protocole (JSON Lines sur stdin/stdout, un objet par ligne) :
 
-Pour chaque segment termine, imprime UNE ligne JSON sur stdout (streaming,
-pas attendre la fin du fichier) :
-    {"index": 0, "ok": true, "out": "/chemin/seg0.wav"}
-    {"index": 1, "ok": false, "error": "..."}
-afin que l'appelant (Rust) puisse suivre la progression segment par segment
-et ne pas attendre la fin du fichier entier pour afficher quoi que ce soit.
+  - Au demarrage, une fois le modele charge, une ligne annonce le device :
+        {"device": "cuda"}  (ou "cpu")
 
-Usage:
-    <stdin JSON> | python clone_tts.py [--gpu]
+  - Pour CHAQUE fichier a traiter, le process Rust ecrit UNE ligne requete :
+        {"req_id": 0, "lang": "en", "speaker": "/chemin/ref.wav",
+         "items": [{"text": "...", "out": "/chemin/seg0.wav"}, ...]}
+
+  - Pour chaque segment termine, ce script repond par UNE ligne (streaming,
+    pas besoin d'attendre la fin du fichier) :
+        {"req_id": 0, "index": 0, "ok": true, "out": "/chemin/seg0.wav"}
+        {"req_id": 0, "index": 1, "ok": false, "error": "..."}
+    puis, une fois TOUS les segments de ce fichier traites :
+        {"req_id": 0, "done": true}
+    Le process attend alors la prochaine ligne requete sur stdin (fichier
+    suivant), et ainsi de suite jusqu'a fermeture de stdin par l'appelant.
+
+Usage :
+    python clone_tts.py [--gpu]   # puis une ligne JSON par fichier sur stdin
 
 Installation (necessite Python 3.9-3.11, et idealement un GPU mais marche
 aussi sur CPU, plus lentement):
@@ -36,7 +50,38 @@ qu'aucun CUDA n'est detecte, on retombe automatiquement sur le CPU.
 """
 import argparse
 import json
+import os
 import sys
+
+# Le modele XTTS-v2 est sous licence non-commerciale (CPML) : au tout
+# premier chargement, Coqui TTS demande une confirmation interactive
+# (input() sur la console) avant de telecharger/charger le modele. Notre
+# stdin est un pipe (pas un vrai terminal), donc ce prompt resterait bloque
+# indefiniment a attendre une frappe qui n'arrivera jamais. Cette variable
+# d'environnement contourne le prompt (la meme licence est quand meme
+# rappelee ci-dessous, pour que l'utilisateur sache a quoi il consent).
+# setdefault : si le cote Rust l'a deja positionnee, on ne l'ecrase pas.
+os.environ.setdefault("COQUI_TOS_AGREED", "1")
+
+# Filet de securite : si malgre COQUI_TOS_AGREED une version de la lib
+# appelle quand meme input() (autre prompt, version differente, etc.), on
+# repond automatiquement "y" au lieu de rester bloque indefiniment sur un
+# stdin qui n'est pas un vrai terminal. On logue sur stderr pour que ce ne
+# soit jamais silencieux.
+import builtins  # noqa: E402
+
+_orig_input = builtins.input
+
+
+def _auto_yes_input(prompt: str = "") -> str:
+    print(
+        f"[voxdub] prompt interactif intercepte (repondu automatiquement 'y') : {prompt!r}",
+        file=sys.stderr,
+    )
+    return "y"
+
+
+builtins.input = _auto_yes_input
 
 # Sur Windows, stdin/stdout/stderr utilisent par defaut l'encodage console
 # local (cp1252 typiquement), pas UTF-8. Des lors qu'un texte transcrit ou
@@ -118,11 +163,6 @@ def main() -> None:
     parser.add_argument("--gpu", action="store_true", help="Utiliser le GPU (CUDA) si disponible")
     args = parser.parse_args()
 
-    request = json.loads(sys.stdin.read())
-    lang = request["lang"]
-    speaker = request["speaker"]
-    items = request["items"]  # [{"text": ..., "out": ...}, ...]
-
     cuda_ok = torch.cuda.is_available()
     print(
         f"[voxdub] torch={torch.__version__}  torch_cuda_build={torch.version.cuda}  "
@@ -150,6 +190,14 @@ def main() -> None:
     use_gpu = bool(args.gpu) and cuda_ok
     device = "cuda" if use_gpu else "cpu"
 
+    print(
+        "[voxdub] chargement du modele XTTS-v2 (licence non-commerciale CPML, "
+        "confirmation auto via COQUI_TOS_AGREED=1 - voir "
+        "https://coqui.ai/cpml.txt) ... peut prendre 10-30s, ou plusieurs "
+        "minutes au tout premier lancement le temps du telechargement (~2 Go).",
+        file=sys.stderr,
+    )
+
     # NOTE: le kwarg historique `TTS(model, gpu=True)` est peu fiable selon
     # la version de coqui-tts/TTS installee (silencieusement ignore sur
     # certaines versions) ; `.to(device)` explicite est la facon documentee
@@ -168,17 +216,40 @@ def main() -> None:
     # se passe bien (le stderr n'est normalement affiche qu'en cas d'echec).
     emit({"device": device})
 
-    for i, item in enumerate(items):
-        text = item["text"]
-        out = item["out"]
+    # Boucle persistante : une ligne JSON sur stdin = un fichier entier a
+    # traiter. `for line in sys.stdin` bloque (sans consommer de CPU) tant
+    # qu'aucune ligne n'est disponible, et se termine proprement des que
+    # l'appelant ferme stdin (EOF) - c'est le signal "plus rien a faire,
+    # tu peux t'arreter" ; aucune commande d'arret explicite n'est donc
+    # necessaire.
+    for raw_line in sys.stdin:
+        raw_line = raw_line.strip()
+        if not raw_line:
+            continue
         try:
-            if text.strip():
-                tts.tts_to_file(text=text, speaker_wav=speaker, language=lang, file_path=out)
-            else:
-                write_silence(out)
-            emit({"index": i, "ok": True, "out": out})
-        except Exception as e:
-            emit({"index": i, "ok": False, "error": str(e)})
+            request = json.loads(raw_line)
+        except json.JSONDecodeError as e:
+            emit({"fatal": f"ligne requete non-JSON recue : {e}"})
+            continue
+
+        req_id = request.get("req_id")
+        lang = request["lang"]
+        speaker = request["speaker"]
+        items = request["items"]  # [{"text": ..., "out": ...}, ...]
+
+        for i, item in enumerate(items):
+            text = item["text"]
+            out = item["out"]
+            try:
+                if text.strip():
+                    tts.tts_to_file(text=text, speaker_wav=speaker, language=lang, file_path=out)
+                else:
+                    write_silence(out)
+                emit({"req_id": req_id, "index": i, "ok": True, "out": out})
+            except Exception as e:
+                emit({"req_id": req_id, "index": i, "ok": False, "error": str(e)})
+
+        emit({"req_id": req_id, "done": True})
 
 
 if __name__ == "__main__":
