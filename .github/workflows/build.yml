@@ -33,9 +33,6 @@ jobs:
           - os: macos-latest
             artifact: voxdub-macos-arm64
             bin_name: voxdub
-          - os: macos-13 # Intel runner
-            artifact: voxdub-macos-x64
-            bin_name: voxdub
           - os: ubuntu-latest
             artifact: voxdub-linux-x64
             bin_name: voxdub
